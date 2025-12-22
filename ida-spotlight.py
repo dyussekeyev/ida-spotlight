@@ -451,7 +451,7 @@ class ChunkedScanner(QtCore.QObject):
 
                 # --- detect FUNC_LIB (FLIRT) ---
                 try:
-                    flags = ida_funcs.get_func_flags(start)
+                    flags = idc.get_func_flags(start)
                     if flags & ida_funcs.FUNC_LIB:
                         res["is_library"] = True
                 except Exception:
