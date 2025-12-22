@@ -70,6 +70,13 @@ View → Open subviews → IDA Spotlight View
 
 ---
 
+## Animation
+
+![Spotlight View](screenshots/view.gif)
+![Spotlight Inspect](screenshots/inspect.gif)
+
+---
+
 ## Screenshots
 
 ![Spotlight View](screenshots/view.png)
@@ -87,3 +94,4 @@ Email: dyussekeyev@yandex.kz
 ## License
 
 Apache-2.0
+
