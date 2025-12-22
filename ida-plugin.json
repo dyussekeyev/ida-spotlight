@@ -3,19 +3,36 @@
   "plugin": {
     "name": "IDA Spotlight",
     "entryPoint": "ida-spotlight.py",
-    "version": "0.0.1",
-    "description" : "Workflow-centric function triage and prioritization plugin for IDA Pro",
+    "version": "0.0.2",
+    "description": "Workflow-centric function triage and prioritization plugin for IDA Pro",
     "urls": {
       "repository": "https://github.com/dyussekeyev/ida-spotlight"
     },
-    "authors": [{
-      "name": "Askar Dyussekeyev",
-      "email": "dyussekeyev@yandex.kz"
-    }],
-    "idaVersions": ">=9.1",
+    "authors": [
+      {
+        "name": "Askar Dyussekeyev",
+        "email": "dyussekeyev@yandex.kz"
+      }
+    ],
+    "idaVersions": [
+      "9.1",
+      "9.2"
+    ],
     "platforms": "windows-x86_64",
     "license": "Apache-2.0",
-    "categories": ["malware-analysis","collaboration-and-productivity"],
-    "keywords": ["malware","malware analysis","focus","spotlight"]
+    "categories": [
+      "malware-analysis",
+      "collaboration-and-productivity"
+    ],
+    "keywords": [
+      "malware",
+      "malware analysis",
+      "focus",
+      "spotlight"
+    ],
+    "pythonDependencies": [
+      "PySide6",
+      "shiboken6"
+    ]
   }
 }
