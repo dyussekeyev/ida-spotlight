@@ -1,5 +1,5 @@
 {
-  "IDAMetadataDescriptorVersion": 1,
+  "IDAMetadataDescriptorVersion": 2,
   "plugin": {
     "name": "IDA Spotlight",
     "entryPoint": "ida-spotlight.py",
@@ -18,7 +18,7 @@
       "9.1",
       "9.2"
     ],
-    "platforms": "windows-x86_64",
+    "platforms": ["windows-x86_64"],
     "license": "Apache-2.0",
     "categories": [
       "malware-analysis",
