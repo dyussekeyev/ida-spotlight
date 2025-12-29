@@ -1,32 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 #
 # IDA Spotlight — Function triage for IDA 9.2+ (IDAPython / PySide6)
-#
-# Subviews:
-#  1) IDA Spotlight View
-#     - Table + Inspector (right) + Search (bottom)
-#     - Double-click (or Enter) = jump to function
-#     - Context menu in table:
-#         - Hide Low Priority (toggle)
-#         - Hide Library Functions (toggle)        <-- NEW (default ON)
-#         - Inspect here (update Inspect window without jumping)
-#         - Copy cell/row/selected
-#         - Export CSV/JSON
-#     - Toolbar buttons: Scan, Export
-#
-#  2) IDA Spotlight Inspect
-#     - Inspector-only window
-#     - Context menu:
-#         - Sync with specific view by name (IDA View-A/B/C..., Pseudocode-A/B/C...)
-#         - Unsync, Pin/Unpin, Back/Forward, Copy
-#     - Follows cursor in the chosen source widget via screen_ea_changed + widget filter
-#
-# Library support (FLIRT / FUNC_LIB):
-# - Each function caches is_library during scan (ida_funcs.FUNC_LIB)
-# - Library functions are hidden by default (toggle in View context menu)
-# - Library functions are highlighted light-blue in the table
-# - Library functions DO NOT participate in tier computation (top 10% / top 30%)
-# - Library functions get a score penalty (configurable) and a negative reason
+
+import sqlite3
+import hashlib
 
 import csv
 import json
@@ -45,6 +22,9 @@ import ida_ua
 import ida_lines
 import ida_bytes
 import idc
+import ida_nalt
+import ida_segment
+import ida_netnode
 
 from PySide6 import QtWidgets, QtCore, QtGui
 import shiboken6
@@ -54,20 +34,65 @@ import shiboken6
 # Config
 # ----------------------------------------------------------------------
 
-# How hard we downrank library functions (applied to base_score and final_score).
-# Keep it moderate: enough to push libs down, not enough to obliterate meaningful hits.
-LIBRARY_SCORE_PENALTY = 3.0
+from spotlight_shared import (
+    load_signals_and_config,
+    normalize_name,
+    normalize_dll_name,
+    build_func_filters,
+    is_filtered_func,
+    build_common_sections,
+    build_common_import_dlls,
+    default_kb_db_path,
+)
 
-# Table row background for library functions
+BASE_DIR = os.path.dirname(__file__)
+SIGNALS, CFG = load_signals_and_config(BASE_DIR)
+
+FUNC_FILTERS = build_func_filters(CFG)
+COMMON_SECTIONS = build_common_sections(CFG)
+COMMON_IMPORT_DLLS = build_common_import_dlls(CFG)
+
+CONTEXT_BONUS_FACTOR = float(CFG.get("context_bonus_factor", 0.15))
+LIBRARY_SCORE_PENALTY = float(CFG.get("library_score_penalty", 3.0))
+
 LIBRARY_ROW_COLOR = QtGui.QColor(160, 220, 255)
 
 
 # ----------------------------------------------------------------------
-# Files / Context
+# Spotlight KB (SQLite) config
 # ----------------------------------------------------------------------
 
-BASE_DIR = os.path.dirname(__file__)
-SIGNALS_FILE = os.path.join(BASE_DIR, "signals.json")
+KB_NODE_NAME = "$ ida_spotlight_kb"
+
+
+def kb_node():
+    return ida_netnode.netnode(KB_NODE_NAME, ida_netnode.NETNODE_CREATE)
+
+
+def kb_get_setting(key: str, default: str = "") -> str:
+    try:
+        val = kb_node().get(key)
+        if val is None:
+            return default
+        return val.decode("utf-8")
+    except Exception:
+        return default
+
+
+def kb_set_setting(key: str, value: str):
+    try:
+        kb_node().set(key, value.encode("utf-8"))
+    except Exception:
+        pass
+
+
+def kb_db_path() -> str:
+    # Stored per-IDB via netnode; empty => default
+    p = (kb_get_setting("db_path", "") or "").strip()
+    return p if p else default_kb_db_path()
+
+
+KB_MAX_HITS = 50
 
 
 class SpotlightContext:
@@ -79,20 +104,8 @@ class SpotlightContext:
 
 
 CTX = SpotlightContext()
-
-
-def load_signals():
-    if not os.path.exists(SIGNALS_FILE):
-        raise FileNotFoundError(f"Missing {SIGNALS_FILE}")
-
-    with open(SIGNALS_FILE, "r", encoding="utf-8") as f:
-        data = json.load(f)
-
-    cats = list(data.keys())
-    for cat in cats:
-        data[cat].setdefault("functions", {})
-        data[cat].setdefault("strings", {})
-    return data, cats
+CTX.signals = SIGNALS
+CTX.categories = sorted(SIGNALS.keys())
 
 
 # ----------------------------------------------------------------------
@@ -162,6 +175,29 @@ def widget_title(widget) -> str:
         return ""
 
 
+def get_qt_parent():
+    try:
+        w = ida_kernwin.get_current_widget()
+        return ida_kernwin.PluginForm.FormToPyQtWidget(w)
+    except Exception:
+        return None
+
+
+def _extract_view_letter_from_title(title: str) -> Optional[str]:
+    # Expected: "IDA View-A", "Pseudocode-A"
+    m = re.match(r"^(IDA View|Pseudocode)-([A-Z])$", (title or "").strip())
+    if not m:
+        return None
+    return m.group(2)
+
+
+def _paired_view_titles(title: str) -> List[str]:
+    letter = _extract_view_letter_from_title(title)
+    if not letter:
+        return [title]
+    return [f"IDA View-{letter}", f"Pseudocode-{letter}"]
+
+
 def find_code_widget_by_title(title: str):
     try:
         w = ida_kernwin.find_widget(title)
@@ -172,6 +208,223 @@ def find_code_widget_by_title(title: str):
     if not is_code_widget(w):
         return None
     return w
+
+
+# ----------------------------------------------------------------------
+# Spotlight KB (SQLite) helpers
+# ----------------------------------------------------------------------
+
+def kb_db_connect() -> sqlite3.Connection:
+    conn = sqlite3.connect(kb_db_path())
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def kb_db_ready() -> bool:
+    p = kb_db_path()
+    if not os.path.exists(p):
+        return False
+    try:
+        with kb_db_connect() as c:
+            c.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='idb'")
+            if c.fetchone() is None:
+                return False
+            # sanity: new schema tables should exist
+            c.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='feat_import_func'")
+            return c.fetchone() is not None
+    except Exception:
+        return False
+
+
+def kb_db_diagnose(path: str) -> str:
+    if not path:
+        return "database path is empty"
+
+    if not os.path.exists(path):
+        return "file does not exist"
+
+    try:
+        conn = sqlite3.connect(path)
+    except sqlite3.Error as e:
+        return f"sqlite open failed: {e}"
+
+    try:
+        cur = conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='idb'"
+        )
+        if cur.fetchone() is None:
+            return "sqlite opened, but Spotlight schema missing (table 'idb')"
+    except sqlite3.Error as e:
+        return f"schema check failed: {e}"
+    finally:
+        conn.close()
+
+    return ""  # OK
+
+
+# ----------------------------------------------------------------------
+# Sample profile (for KB correlation)
+# ----------------------------------------------------------------------
+
+def _iter_import_items_filtered() -> List[str]:
+    # Build "dll_norm!func_norm" list (matching indexer) and filter common imports by default.
+    items: List[str] = []
+    try:
+        qty = ida_nalt.get_import_module_qty()
+    except Exception:
+        return items
+
+    for i in range(qty):
+        dll_raw = ida_nalt.get_import_module_name(i) or ""
+        dll_norm = normalize_dll_name(dll_raw)
+        if not dll_norm:
+            continue
+        if dll_norm in COMMON_IMPORT_DLLS:
+            continue
+
+        def cb(ea, name, ord_):
+            if name:
+                fn = normalize_name(str(name))
+            elif ord_ is not None:
+                fn = normalize_name(f"ord{int(ord_)}")
+            else:
+                return True
+            items.append(f"{dll_norm}!{fn}")
+            return True
+
+        try:
+            ida_nalt.enum_import_names(i, cb)
+        except Exception:
+            continue
+
+    return items
+
+
+def spotlight_import_fingerprint(import_items: List[str]) -> str:
+    s = ",".join(sorted(import_items))
+    return hashlib.md5(s.encode("utf-8", errors="ignore")).hexdigest()
+
+
+def _iter_section_norms_filtered() -> List[str]:
+    out: List[str] = []
+    try:
+        for seg_ea in idautils.Segments():
+            seg = ida_segment.getseg(int(seg_ea))
+            if not seg:
+                continue
+            name_raw = ida_segment.get_segm_name(seg) or ""
+            name_norm = normalize_name(name_raw)
+            if not name_norm:
+                continue
+            if name_norm in COMMON_SECTIONS:
+                continue
+            out.append(name_norm)
+    except Exception:
+        pass
+    return out
+
+
+def extract_sample_profile_for_kb() -> Dict[str, Any]:
+    import_items = _iter_import_items_filtered()
+    import_fingerprint = spotlight_import_fingerprint(import_items)
+
+    # For overlap scoring
+    dll_norms = sorted({x.split("!", 1)[0] for x in import_items if "!" in x})
+    import_func_norms = sorted({x.split("!", 1)[1] for x in import_items if "!" in x})
+
+    section_norms = sorted(set(_iter_section_norms_filtered()))
+
+    return {
+        "import_items": import_items,
+        "import_fingerprint": import_fingerprint,
+        "dll_norms": dll_norms,
+        "import_func_norms": import_func_norms,
+        "section_norms": section_norms,
+    }
+
+
+# ----------------------------------------------------------------------
+# KB queries
+# ----------------------------------------------------------------------
+
+def kb_paths_by_import_fingerprint(fp: str) -> List[str]:
+    fp = (fp or "").strip()
+    if not fp:
+        return []
+    with kb_db_connect() as c:
+        rows = c.execute(
+            """
+            SELECT path
+            FROM idb
+            WHERE import_fingerprint = ?
+            ORDER BY path
+            LIMIT ?
+            """,
+            (fp, KB_MAX_HITS + 1),
+        ).fetchall()
+        return [r["path"] for r in rows]
+
+
+def kb_paths_by_section_norms(section_norms: List[str]) -> List[str]:
+    section_norms = [s for s in (section_norms or []) if s]
+    if not section_norms:
+        return []
+    qmarks = ",".join(["?"] * len(section_norms))
+    with kb_db_connect() as c:
+        rows = c.execute(
+            f"""
+            SELECT DISTINCT idb.path AS path
+            FROM feat_section s
+            JOIN idb ON idb.id = s.idb_id
+            WHERE s.name_norm IN ({qmarks})
+            ORDER BY path
+            LIMIT ?
+            """,
+            (*section_norms, KB_MAX_HITS + 1),
+        ).fetchall()
+        return [r["path"] for r in rows]
+
+
+def kb_paths_by_import_func_norms(import_func_norms: List[str]) -> List[str]:
+    import_func_norms = [s for s in (import_func_norms or []) if s]
+    if not import_func_norms:
+        return []
+    qmarks = ",".join(["?"] * len(import_func_norms))
+    with kb_db_connect() as c:
+        rows = c.execute(
+            f"""
+            SELECT DISTINCT idb.path AS path
+            FROM feat_import_func f
+            JOIN idb ON idb.id = f.idb_id
+            WHERE f.func_norm IN ({qmarks})
+            ORDER BY path
+            LIMIT ?
+            """,
+            (*import_func_norms, KB_MAX_HITS + 1),
+        ).fetchall()
+        return [r["path"] for r in rows]
+
+
+def kb_paths_for_function_name_raw(name_raw: str) -> List[str]:
+    n = (name_raw or "").strip()
+    if not n:
+        return []
+    if is_filtered_func(n, FUNC_FILTERS):
+        return []
+    nn = normalize_name(n)
+    with kb_db_connect() as c:
+        rows = c.execute(
+            """
+            SELECT DISTINCT idb.path AS path
+            FROM func
+            JOIN idb ON idb.id = func.idb_id
+            WHERE func.name_norm = ?
+            ORDER BY path
+            LIMIT ?
+            """,
+            (nn, KB_MAX_HITS + 1),
+        ).fetchall()
+        return [r["path"] for r in rows]
 
 
 # ----------------------------------------------------------------------
@@ -206,6 +459,7 @@ def extract_calls(func_start_ea: int) -> List[str]:
 
 
 def extract_strings_by_xrefs(func_start_ea: int) -> List[str]:
+    # still used for local scoring
     strings = set()
     f = ida_funcs.get_func(int(func_start_ea))
     if not f:
@@ -240,7 +494,6 @@ def init_func_result(start_ea: int, name: str, length: int) -> Dict[str, Any]:
         "name": name or f"sub_{int(start_ea):x}",
         "length": int(length),
 
-        # FLIRT / FUNC_LIB
         "is_library": False,
 
         "base_score": 0.0,
@@ -248,7 +501,7 @@ def init_func_result(start_ea: int, name: str, length: int) -> Dict[str, Any]:
         "final_score": 0.0,
 
         "category_hits": {c: 0 for c in CTX.categories},
-        "reasons": [],  # list[{"category": str, "text": str, "weight": float}]
+        "reasons": [],
     }
 
 
@@ -281,7 +534,6 @@ def score_function_base(res: Dict[str, Any], calls: List[str], strings: List[str
 def apply_library_penalty(res: Dict[str, Any]):
     if not res.get("is_library"):
         return
-    # Downrank libs (base + final), and keep it explainable.
     res["base_score"] -= float(LIBRARY_SCORE_PENALTY)
     res["final_score"] -= float(LIBRARY_SCORE_PENALTY)
     add_reason(res, "Library", "Library function penalty", -float(LIBRARY_SCORE_PENALTY))
@@ -313,7 +565,7 @@ def apply_context_bonus(results: Dict[int, Dict[str, Any]]):
                 best_ea = int(callee.start_ea)
 
         if best_score >= 4.0 and best_ea is not None:
-            bonus = best_score * 0.15
+            bonus = best_score * float(CONTEXT_BONUS_FACTOR)
             r["context_bonus"] = bonus
             r["final_score"] += bonus
             add_reason(r, "Context", f"Adjacent to {ida_funcs.get_func_name(best_ea)}", bonus)
@@ -334,12 +586,6 @@ def priority_color(priority: str) -> Optional[QtGui.QColor]:
 
 
 def compute_priority_tiers(rows_sorted: List[Dict[str, Any]]) -> Dict[int, str]:
-    """
-    rows_sorted must already be sorted by (-score, length).
-    critical/high/medium are computed ONLY among:
-      - score > 0
-      - NOT library functions
-    """
     tiers: Dict[int, str] = {}
     positives = [
         r for r in rows_sorted
@@ -368,7 +614,7 @@ def compute_priority_tiers(rows_sorted: List[Dict[str, Any]]) -> Dict[int, str]:
 
 
 # ----------------------------------------------------------------------
-# Inspector rendering (shared)
+# Inspector rendering
 # ----------------------------------------------------------------------
 
 def render_inspector(res: Dict[str, Any], priority_name: Optional[str] = None) -> str:
@@ -392,6 +638,108 @@ def render_inspector(res: Dict[str, Any], priority_name: Optional[str] = None) -
     else:
         for rr in sorted(reasons, key=lambda x: float(x.get("weight", 0.0)), reverse=True):
             lines.append(f"  - [{rr.get('category','')}] {rr.get('text','')}: {float(rr.get('weight',0.0)):+.2f}")
+
+    return "\n".join(lines)
+
+
+def render_kb_correlation_block(func_start: int, func_name: str, calls: List[str]) -> str:
+    title = "Spotlight KB correlation"
+    lines = [title, "-" * len(title)]
+    db_path = kb_db_path()
+    reason = kb_db_diagnose(db_path)
+
+    if reason:
+        lines.append("KB not ready:")
+        lines.append(f"- {reason}")
+        lines.append(f"Path: {db_path}")
+        return "\n".join(lines)
+
+
+    prof = extract_sample_profile_for_kb()
+
+    # Strong: import_fingerprint
+    fp = prof.get("import_fingerprint", "")
+    strong_paths = kb_paths_by_import_fingerprint(fp) if fp else []
+    if strong_paths:
+        lines.append("Strong:")
+        lines.append(f"- import_fingerprint match ({len(strong_paths)}):")
+        for p in strong_paths[:10]:
+            lines.append(f"  - {p}")
+        if len(strong_paths) > 10:
+            lines.append(f"  ... ({len(strong_paths) - 10} more)")
+    else:
+        lines.append("Strong:")
+        lines.append("- (none)")
+
+    # Medium: overlap by import funcs / sections
+    import_func_norms = prof.get("import_func_norms", []) or []
+    sec_norms = prof.get("section_norms", []) or []
+
+    imp_paths = kb_paths_by_import_func_norms(import_func_norms[:200]) if import_func_norms else []
+    sec_paths = kb_paths_by_section_norms(sec_norms[:100]) if sec_norms else []
+
+    lines.append("")
+    lines.append("Medium:")
+    if imp_paths:
+        lines.append(f"- imported function overlap (any) ({len(imp_paths)}):")
+        for p in imp_paths[:10]:
+            lines.append(f"  - {p}")
+        if len(imp_paths) > 10:
+            lines.append(f"  ... ({len(imp_paths) - 10} more)")
+    else:
+        lines.append("- imported function overlap: (none)")
+
+    if sec_paths:
+        lines.append(f"- section name overlap (any) ({len(sec_paths)}):")
+        for p in sec_paths[:10]:
+            lines.append(f"  - {p}")
+        if len(sec_paths) > 10:
+            lines.append(f"  ... ({len(sec_paths) - 10} more)")
+    else:
+        lines.append("- section name overlap: (none)")
+
+    # Function name recall
+    lines.append("")
+    fn_paths = kb_paths_for_function_name_raw(func_name)
+    lines.append(f"Function name recall: {func_name}")
+    if fn_paths:
+        for p in fn_paths[:10]:
+            lines.append(f"- {p}")
+        if len(fn_paths) > 10:
+            lines.append(f"... ({len(fn_paths) - 10} more)")
+    else:
+        lines.append("(no matches)")
+
+    # Callee recall
+    lines.append("")
+    lines.append("Callee recall:")
+    callees = []
+    seen = set()
+    for c in calls:
+        cc = (c or "").strip()
+        if not cc:
+            continue
+        if is_filtered_func(cc, FUNC_FILTERS):
+            continue
+        if cc.lower() in seen:
+            continue
+        seen.add(cc.lower())
+        callees.append(cc)
+
+    if not callees:
+        lines.append("(no callees)")
+        return "\n".join(lines)
+
+    # Show top N callees; for each show first few matching IDBs
+    for callee in callees[:25]:
+        paths = kb_paths_for_function_name_raw(callee)
+        if not paths:
+            continue
+        lines.append(f"- {callee}:")
+        for p in paths[:5]:
+            lines.append(f"  - {p}")
+        if len(paths) > 5:
+            lines.append(f"  ... ({len(paths) - 5} more)")
 
     return "\n".join(lines)
 
@@ -449,7 +797,6 @@ class ChunkedScanner(QtCore.QObject):
 
                 res = init_func_result(start, name, length)
 
-                # --- detect FUNC_LIB (FLIRT) ---
                 try:
                     flags = idc.get_func_flags(start)
                     if flags & ida_funcs.FUNC_LIB:
@@ -461,8 +808,6 @@ class ChunkedScanner(QtCore.QObject):
                     calls = extract_calls(start)
                     strs = extract_strings_by_xrefs(start)
                     score_function_base(res, calls, strs)
-
-                    # Apply library penalty immediately (so it affects context bonus math too)
                     apply_library_penalty(res)
                 except Exception as e:
                     add_reason(res, "Error", f"Scan error: {e}", 0.0)
@@ -499,8 +844,6 @@ class ChunkedScanner(QtCore.QObject):
 
 VIEW_FORM = None
 INSPECT_FORM = None
-
-
 LAST_CODE_WIDGET = None
 
 
@@ -508,7 +851,6 @@ def ensure_inspect_view():
     global INSPECT_FORM
     if INSPECT_FORM is not None and qt_alive(getattr(INSPECT_FORM, "inspector", None)):
         return INSPECT_FORM
-
     INSPECT_FORM = SpotlightInspectForm()
     INSPECT_FORM.Show("IDA Spotlight Inspect")
     return INSPECT_FORM
@@ -519,7 +861,6 @@ def ensure_inspect_view():
 # ----------------------------------------------------------------------
 
 class SpotlightUIHooks(ida_kernwin.UI_Hooks):
-    # IDA 9.2 SWIG can pass extra args; accept *args to avoid mismatch.
     def screen_ea_changed(self, ea, *args):
         global LAST_CODE_WIDGET
 
@@ -536,7 +877,22 @@ class SpotlightUIHooks(ida_kernwin.UI_Hooks):
         if not qt_alive(getattr(INSPECT_FORM, "inspector", None)):
             return
 
-        INSPECT_FORM.on_screen_ea_changed(w, int(ea))
+        title = widget_title(w)
+        INSPECT_FORM.on_screen_ea_changed(title, int(ea))
+
+
+    def finish_populating_widget_popup(self, widget, popup, ctx):
+        try:
+            wtype = ida_kernwin.get_widget_type(widget)
+        except Exception:
+            return
+
+        if wtype not in (ida_kernwin.BWN_DISASM, ida_kernwin.BWN_PSEUDOCODE):
+            return
+
+        ida_kernwin.attach_action_to_popup(widget, popup, "ida_spotlight:inspect_sync_here", "IDA Spotlight/")
+        ida_kernwin.attach_action_to_popup(widget, popup, "ida_spotlight:view_open", "IDA Spotlight/")
+        ida_kernwin.attach_action_to_popup(widget, popup, "ida_spotlight:inspect_open", "IDA Spotlight/")
 
 
 UI_HOOKS = None
@@ -549,8 +905,7 @@ UI_HOOKS = None
 class SpotlightInspectForm(ida_kernwin.PluginForm):
     def __init__(self):
         super().__init__()
-        self._sync_widget = None
-        self._sync_widget_title = ""
+        self._sync_titles: List[str] = []
         self._pinned = False
         self._history: List[int] = []
         self._hist_idx: int = -1
@@ -571,9 +926,7 @@ class SpotlightInspectForm(ida_kernwin.PluginForm):
 
         self.inspector = QtWidgets.QPlainTextEdit()
         self.inspector.setReadOnly(True)
-
-        self.inspector.setPlainText("Right-click to sync with an IDA view.\n")
-
+        self.inspector.setPlainText("Use context menu in IDA View / Pseudocode to sync.\n")
         layout.addWidget(self.inspector, 1)
 
         self.inspector.setContextMenuPolicy(QtCore.Qt.CustomContextMenu)
@@ -584,8 +937,7 @@ class SpotlightInspectForm(ida_kernwin.PluginForm):
     def OnClose(self, form):
         global INSPECT_FORM
         INSPECT_FORM = None
-        self._sync_widget = None
-        self._sync_widget_title = ""
+        self._sync_titles = []
         self._history = []
         self._hist_idx = -1
         self.header = None
@@ -595,102 +947,92 @@ class SpotlightInspectForm(ida_kernwin.PluginForm):
     def _update_header(self):
         if self.header is None:
             return
-        if self._sync_widget is None:
+        if not self._sync_titles:
             s = "Not synced"
         else:
-            s = f"Synced: {self._sync_widget_title}"
+            s = "Synced: " + ", ".join(self._sync_titles)
         if self._pinned:
             s += " (Pinned)"
         self.header.setText(s)
 
-    def _sync_set_widget(self, w):
-        if w is None:
-            ida_kernwin.warning("Widget not found.")
+    def sync_with_titles(self, titles: List[str]):
+        titles = [t for t in titles if t]
+
+        ok = False
+        for t in titles:
+            if find_code_widget_by_title(t) is not None:
+                ok = True
+                break
+
+        if not ok:
+            ida_kernwin.warning("No matching code widgets found to sync.")
             return
 
-        if not is_code_widget(w):
-            ida_kernwin.warning("Selected widget is not Disassembly or Pseudocode.")
-            return
-
-        self._sync_widget = w
-        self._sync_widget_title = widget_title(w) or "<?>"
+        self._sync_titles = titles
         self._update_header()
 
         ea = ida_kernwin.get_screen_ea()
         self.update_for_ea(int(ea), push_history=True)
 
-    def sync_with_title(self, title: str):
-        w = find_code_widget_by_title(title)
-        if w is None:
-            ida_kernwin.warning(f"Cannot find code view: {title}")
+    def _sync_replace_current(self):
+        w = ida_kernwin.get_current_widget()
+        title = widget_title(w)
+        if not title:
             return
-        self._sync_set_widget(w)
+        self.sync_with_titles([title])
 
     def unsync(self):
-        self._sync_widget = None
-        self._sync_widget_title = ""
+        self._sync_titles = []
         self._update_header()
 
+    def toggle_pin(self):
+        self._pinned = not self._pinned
+        self._update_header()
+
+    def history_back(self):
+        if self._hist_idx > 0:
+            self._hist_idx -= 1
+            ea = self._history[self._hist_idx]
+            self.update_for_ea(ea, push_history=False)
+
+    def history_forward(self):
+        if self._hist_idx + 1 < len(self._history):
+            self._hist_idx += 1
+            ea = self._history[self._hist_idx]
+            self.update_for_ea(ea, push_history=False)
+
+
     def open_menu(self, pos):
-        menu = QtWidgets.QMenu()
+        menu = QtWidgets.QMenu(self.inspector)
 
-        sync_menu = menu.addMenu("Sync with…")
-
-        for letter in "ABCDEFGH":
-            sync_menu.addAction(f"IDA View-{letter}")
-        sync_menu.addSeparator()
-        for letter in "ABCDEFGH":
-            sync_menu.addAction(f"Pseudocode-{letter}")
-
-        act_unsync = menu.addAction("Unsync")
+        act_unsync = QtGui.QAction("Unsync", self.inspector)
+        act_unsync.triggered.connect(self.unsync)
+        menu.addAction(act_unsync)
 
         menu.addSeparator()
 
-        act_pin = menu.addAction("Pin" if not self._pinned else "Unpin")
+        act_pin = QtGui.QAction("Pin / Unpin", self.inspector)
+        act_pin.triggered.connect(self.toggle_pin)
+        menu.addAction(act_pin)
 
         menu.addSeparator()
 
-        act_back = menu.addAction("Back")
-        act_fwd = menu.addAction("Forward")
-        act_back.setEnabled(self._hist_idx > 0)
-        act_fwd.setEnabled(0 <= self._hist_idx < (len(self._history) - 1))
+        act_back = QtGui.QAction("Back", self.inspector)
+        act_back.triggered.connect(self.history_back)
+        menu.addAction(act_back)
 
-        menu.addSeparator()
+        act_fwd = QtGui.QAction("Forward", self.inspector)
+        act_fwd.triggered.connect(self.history_forward)
+        menu.addAction(act_fwd)
 
-        act_copy = menu.addAction("Copy inspector text")
+        menu.exec_(self.inspector.mapToGlobal(pos))
 
-        act = menu.exec_(self.inspector.mapToGlobal(pos))
-        if not act:
-            return
 
-        txt = act.text()
-        if act == act_unsync:
-            self.unsync()
-            return
-        if act == act_pin:
-            self._pinned = not self._pinned
-            self._update_header()
-            return
-        if act == act_back:
-            self.go_back()
-            return
-        if act == act_fwd:
-            self.go_forward()
-            return
-        if act == act_copy:
-            QtWidgets.QApplication.clipboard().setText(self.inspector.toPlainText())
-            return
-
-        if txt.startswith("IDA View-") or txt.startswith("Pseudocode-"):
-            self.sync_with_title(txt)
-            return
-
-    def on_screen_ea_changed(self, active_widget, ea: int):
+    def on_screen_ea_changed(self, title: str, ea: int):
         if self._pinned:
             return
-        if self._sync_widget is None:
-            return
-        if active_widget != self._sync_widget:
+
+        if title not in self._sync_titles:
             return
 
         self.update_for_ea(ea, push_history=True)
@@ -724,30 +1066,58 @@ class SpotlightInspectForm(ida_kernwin.PluginForm):
         tiers = compute_priority_tiers(rows_all)
         pr = tiers.get(start, "low")
 
-        self.inspector.setPlainText(render_inspector(res, priority_name=pr))
+        # KB correlation + then function info
+        func_name = res.get("name", "") or ""
+        calls = extract_calls(int(start))
+        kb_block = render_kb_correlation_block(int(start), func_name, calls)
+
+        text = kb_block + "\n\n" + render_inspector(res, priority_name=pr)
+        self.inspector.setPlainText(text)
 
         if push_history:
             self._push_history(start)
 
-    def go_back(self):
-        if self._hist_idx <= 0:
-            return
-        self._hist_idx -= 1
-        ea = self._history[self._hist_idx]
-        self.update_for_ea(ea, push_history=False)
-        ida_kernwin.jumpto(ea)
 
-    def go_forward(self):
-        if self._hist_idx >= len(self._history) - 1:
-            return
-        self._hist_idx += 1
-        ea = self._history[self._hist_idx]
-        self.update_for_ea(ea, push_history=False)
-        ida_kernwin.jumpto(ea)
+# ----------------------------------------------------------------------
+# KB Settings dialog (DB path only)
+# ----------------------------------------------------------------------
+
+class SpotlightKBSettingsDialog(QtWidgets.QDialog):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("IDA Spotlight – KB Settings")
+        self.setMinimumWidth(650)
+
+        # empty => default path (same as indexer)
+        cur = (kb_get_setting("db_path", "") or "").strip()
+        self.db_edit = QtWidgets.QLineEdit(cur)
+        self.db_edit.setPlaceholderText(default_kb_db_path())
+
+        form = QtWidgets.QFormLayout()
+        form.addRow("KB database (SQLite):", self.db_edit)
+
+        btn_ok = QtWidgets.QPushButton("OK")
+        btn_ok.clicked.connect(self.accept)
+
+        btn_cancel = QtWidgets.QPushButton("Cancel")
+        btn_cancel.clicked.connect(self.reject)
+
+        btns = QtWidgets.QHBoxLayout()
+        btns.addStretch()
+        btns.addWidget(btn_ok)
+        btns.addWidget(btn_cancel)
+
+        layout = QtWidgets.QVBoxLayout(self)
+        layout.addLayout(form)
+        layout.addLayout(btns)
+
+    def accept(self):
+        kb_set_setting("db_path", (self.db_edit.text() or "").strip())
+        super().accept()
 
 
 # ----------------------------------------------------------------------
-# View Table widget (captures Enter/Return)
+# View Table widget
 # ----------------------------------------------------------------------
 
 class SpotlightTableWidget(QtWidgets.QTableWidget):
@@ -770,7 +1140,7 @@ class SpotlightViewForm(ida_kernwin.PluginForm):
         self._rows: List[Dict[str, Any]] = []
         self._tiers: Dict[int, str] = {}
         self._hide_low_priority: bool = True
-        self._hide_library: bool = True  # NEW default behavior
+        self._hide_library: bool = True
 
     def OnCreate(self, form):
         self.widget = self.FormToPyQtWidget(form)
@@ -894,9 +1264,6 @@ class SpotlightViewForm(ida_kernwin.PluginForm):
 
     def populate(self):
         rows = self._get_rows()
-
-        # IMPORTANT: tier computation must ignore libraries (even if we show them)
-        # That logic lives inside compute_priority_tiers().
         tiers = compute_priority_tiers(rows)
 
         self._rows = rows
@@ -909,7 +1276,6 @@ class SpotlightViewForm(ida_kernwin.PluginForm):
             length = int(r.get("length", 0))
             score = float(r.get("final_score", 0.0))
 
-            # Library wins background (blue) no matter what.
             if r.get("is_library", False):
                 color = LIBRARY_ROW_COLOR
             else:
@@ -954,8 +1320,6 @@ class SpotlightViewForm(ida_kernwin.PluginForm):
         res = CTX.results.get(start_ea)
         if not res:
             return
-
-        # For priority display in View inspector, we still use View tiers (which ignore libraries)
         pr = self._tiers.get(start_ea, "low")
         self.inspector.setPlainText(render_inspector(res, priority_name=pr))
 
@@ -1156,6 +1520,32 @@ class OpenInspectHandler(ida_kernwin.action_handler_t):
         return ida_kernwin.AST_ENABLE_ALWAYS
 
 
+class InspectSyncHereHandler(ida_kernwin.action_handler_t):
+    def activate(self, ctx):
+        insp = ensure_inspect_view()
+        try:
+            w = ida_kernwin.get_current_widget()
+        except Exception:
+            w = None
+        title = widget_title(w) if w is not None else ""
+        titles = _paired_view_titles(title)
+        insp.sync_with_titles(titles)
+        return 1
+
+    def update(self, ctx):
+        return ida_kernwin.AST_ENABLE_ALWAYS
+
+
+class KBConfigureHandler(ida_kernwin.action_handler_t):
+    def activate(self, ctx):
+        dlg = SpotlightKBSettingsDialog(get_qt_parent())
+        dlg.exec_()
+        return 1
+
+    def update(self, ctx):
+        return ida_kernwin.AST_ENABLE_ALWAYS
+
+
 class IDASpotlightPlugin(idaapi.plugin_t):
     flags = idaapi.PLUGIN_KEEP
     wanted_name = "IDA Spotlight"
@@ -1164,7 +1554,9 @@ class IDASpotlightPlugin(idaapi.plugin_t):
         global UI_HOOKS
 
         try:
-            CTX.signals, CTX.categories = load_signals()
+            CTX.signals = SIGNALS
+            CTX.categories = sorted(SIGNALS.keys())
+
             idaapi.msg(f"[IDA Spotlight] Loaded signals.json (categories={len(CTX.categories)})\n")
         except Exception as e:
             CTX.signals, CTX.categories = {}, []
@@ -1173,7 +1565,7 @@ class IDASpotlightPlugin(idaapi.plugin_t):
         try:
             ida_kernwin.create_menu("IDASpotlightMenu", "IDA Spotlight", "View/Open subviews/Strings")
         except Exception:
-            ida_kernwin.warning(f"IDA Spotlight: failed to create IDASpotlightMenu")
+            ida_kernwin.warning("IDA Spotlight: failed to create IDASpotlightMenu")
 
         ida_kernwin.register_action(
             ida_kernwin.action_desc_t(
@@ -1192,6 +1584,47 @@ class IDASpotlightPlugin(idaapi.plugin_t):
             )
         )
 
+        # Popup actions (no submenu complexity in popup itself; IDA still groups by path)
+        ida_kernwin.register_action(
+            ida_kernwin.action_desc_t(
+                "ida_spotlight:inspect_sync_here",
+                "Sync IDA Spotlight Inspect to this view",
+                InspectSyncHereHandler(),
+                None,
+            )
+        )
+        ida_kernwin.register_action(
+            ida_kernwin.action_desc_t(
+                "ida_spotlight:view_open",
+                "IDA Spotlight View",
+                OpenViewHandler(),
+                None,
+            )
+        )
+        ida_kernwin.register_action(
+            ida_kernwin.action_desc_t(
+                "ida_spotlight:inspect_open",
+                "IDA Spotlight Inspect",
+                OpenInspectHandler(),
+                None,
+            )
+        )
+
+        # Menu action: now opens config dialog (DB path only)
+        ida_kernwin.register_action(
+            ida_kernwin.action_desc_t(
+                "ida_spotlight:kb_configure",
+                "Configure Spotlight KB",
+                KBConfigureHandler(),
+                None,
+            )
+        )
+
+        ida_kernwin.attach_action_to_menu(
+            "View/Open subviews/IDA Spotlight/",
+            "ida_spotlight:kb_configure",
+            ida_kernwin.SETMENU_APP
+        )
         ida_kernwin.attach_action_to_menu(
             "View/Open subviews/IDA Spotlight/",
             "ida_spotlight:view",

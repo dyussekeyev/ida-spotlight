@@ -1,4 +1,63 @@
 {
+  "spotlight": {
+    "context_bonus_factor": 0.15,
+    "library_score_penalty": 3.0,
+
+    "func_filters": [
+      "^sub_[0-9a-fA-F]+$",
+      "^unknown_libname_\\d+$",
+	  "^nullsub_\\d+$"
+    ],
+
+    "common_sections": [
+      ".text",
+      ".data",
+      ".rdata",
+      ".bss",
+      ".idata",
+      ".edata",
+      ".rsrc",
+      ".reloc"
+    ],
+
+    "common_import_dlls": [
+      "ntdll.dll",
+      "kernel32.dll",
+      "kernelbase.dll",
+      "user32.dll",
+      "gdi32.dll",
+      "gdi32full.dll",
+      "advapi32.dll",
+      "ws2_32.dll",
+      "wininet.dll",
+      "winhttp.dll",
+      "crypt32.dll",
+      "bcrypt.dll",
+      "secur32.dll",
+      "rpcrt4.dll",
+      "ole32.dll",
+      "oleaut32.dll",
+      "combase.dll",
+      "shell32.dll",
+      "shlwapi.dll",
+      "comdlg32.dll",
+      "urlmon.dll",
+      "msvcrt.dll",
+      "ucrtbase.dll",
+      "vcruntime140.dll",
+      "vcruntime140_1.dll",
+      "comctl32.dll",
+      "uxtheme.dll",
+      "imm32.dll",
+      "winmm.dll",
+      "winscard.dll",
+      "msi.dll",
+      "gdiplus.dll",
+      "oleacc.dll",
+      "winspool.drv"
+    ]
+  },
+
   "networking": {
     "functions": {
       "WSAStartup": 2,
