@@ -1,18 +1,15 @@
-# IDA Spotlight
+# 🔦 IDA Spotlight
 
-**IDA Spotlight** is a workflow-centric triage plugin for IDA Pro that helps reverse engineers quickly identify *high-value* functions in large binaries.
+**IDA Spotlight** is a workflow-centric triage and correlation plugin for IDA Pro that helps reverse engineers quickly identify *high-value* functions in large binaries and *correlate* the current binary with previously analyzed samples.
 
-Instead of manually scrolling through hundreds or thousands of functions, IDA Spotlight scores, ranks, and explains *why* a function may be interesting — enabling analysts to focus their time where it matters most.
+Spotlight is not just a scoring tool — it is a knowledge-driven analysis assistant.
 
 ---
 
 ## Key Features
 
 ### 🔍 Function Scoring & Prioritization
-- Scores functions based on:
-  - API calls
-  - Embedded strings
-  - Contextual relationships between functions
+- Scores functions based on API calls, strings, and contextual relationships.
 - Produces an explainable score with detailed reasons.
 
 ### 🚦 Priority Tiers
@@ -21,12 +18,18 @@ Instead of manually scrolling through hundreds or thousands of functions, IDA Sp
 - Library functions are excluded from top-10% / top-30% calculations.
 
 ### 📚 Library Function Awareness (FLIRT)
-- Detects library functions using IDA’s `FUNC_LIB` flag.
-- Library functions:
-  - Are hidden by default in the main view.
-  - Are visually highlighted in light blue when shown.
-  - Receive a configurable score penalty.
-  - Are clearly marked in the Inspector.
+- Detects library functions using IDA’s ^FUNC_LIB^ flag.
+- Library functions are deprioritized and visually marked.
+- Priority tiers are computed only for non-library code.
+
+### 💡 Spotlight Knowledge Base (KB)
+Spotlight maintains a *SQLite*-based knowledge base of previously analyzed IDBs.
+Each indexed IDB stores structural features such as:
+- Import fingerprints
+- Imported function names
+- Section name profiles
+- Function name normalization
+The KB enables correlation between the current IDB and historical samples.
 
 ### 🙌🏻 Dual‑View Workflow
 - **IDA Spotlight View**
