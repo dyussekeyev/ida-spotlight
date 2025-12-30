@@ -1,5 +1,5 @@
 {
-  "IDAMetadataDescriptorVersion": 2,
+  "IDAMetadataDescriptorVersion": 1,
   "plugin": {
     "name": "IDA Spotlight",
     "entryPoint": "ida-spotlight.py",
@@ -15,7 +15,6 @@
       }
     ],
     "idaVersions": [
-      "9.1",
       "9.2"
     ],
     "platforms": ["windows-x86_64"],
