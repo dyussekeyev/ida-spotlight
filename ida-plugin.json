@@ -2,8 +2,8 @@
   "IDAMetadataDescriptorVersion": 1,
   "plugin": {
     "name": "IDA Spotlight",
-    "entryPoint": "ida-spotlight.py",
-    "version": "0.1.0",
+    "entryPoint": "spotlight.py",
+    "version": "0.1.1",
     "description": "Workflow-centric function triage and prioritization plugin for IDA Pro",
     "urls": {
       "repository": "https://github.com/dyussekeyev/ida-spotlight"
