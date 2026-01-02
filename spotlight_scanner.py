@@ -443,6 +443,19 @@ def render_inspector(result: Dict[str, Any], priority_name: Optional[str] = None
     lines.append(f"Final score: {float(result.get('final_score', 0.0)):.2f}")
     lines.append("")
 
+    # Display reasons for the score
+    lines.append("Reasons:")
+    reasons = result.get("reasons", [])
+    if not reasons:
+        lines.append("  (none)")
+    else:
+        for reason in sorted(reasons, key=lambda x: float(x.get("weight", 0.0)), reverse=True):
+            category = reason.get("category", "")
+            text = reason.get("text", "")
+            weight = float(reason.get("weight", 0.0))
+            lines.append(f"  - [{category}] {text}: {weight:+.2f}")
+    lines.append("")
+
     calls = result.get("calls", [])
     recall = render_function_recall(result["name"], calls)
 
@@ -496,7 +509,6 @@ def render_function_recall(func_name: str, calls: List[str]) -> str:
         unique_callees.append(callee)
 
     if unique_callees:
-        lines.append("")
         lines.append("Callee recall:")
         for callee in unique_callees[:KB_LIMIT_CALLEE_RECALL_MAX_CALLEES]:
             paths = kb_paths_for_function_name_raw(callee)
@@ -505,6 +517,7 @@ def render_function_recall(func_name: str, calls: List[str]) -> str:
             lines.append(f"- {callee}:")
             for path in paths[:KB_LIMIT_CALLEE_RECALL_PER_CALLEE]:
                 lines.append(f"  - {path}")
+        lines.append("")
 
     return "\n".join(lines)
 
