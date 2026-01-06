@@ -19,9 +19,10 @@
     ],
     "platforms": ["windows-x86_64"],
     "license": "Apache-2.0",
+    "logoPath": "ida-plugin.png",
     "categories": [
       "malware-analysis",
-      "collaboration-and-productivity"
+      "ui-ux-and-visualization"
     ],
     "keywords": [
       "malware",
