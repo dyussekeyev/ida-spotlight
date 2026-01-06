@@ -132,7 +132,21 @@ Exports include: function name, address, length, score, priority, library flag, 
    └── ida-plugin.json         # IDA metadata
    ```
 
-3. Launch IDA Pro 9.2+
+3. Install `idalib` using this [guide](https://docs.hex-rays.com/user-guide/idalib)
+
+4. Launch IDA Pro 9.2
+
+### Indexing
+
+1. Run following command:
+```
+C:\Users\User>python "C:\Program Files\IDA Professional 9.2\plugins\ida-spotlight-0.1.2\spotlight_kb_index.py" --idb Z:\idb
+Using Python: C:\Program Files\Python311\python.exe
+KB database: C:\Users\User\AppData\Roaming\Hex-Rays\Ida Pro\IDA Spotlight\ida-spotlight-kb.sqlite
+[1/2] Indexing Z:\idb\ktControl_Panel.exe.i64
+[2/2] Indexing Z:\idb\ktControl_Panel_Tools.exe.i64
+Spotlight KB indexing complete
+```
 
 ### Usage
 
@@ -256,7 +270,7 @@ spotlight.py              # Plugin entry point
 
 ---
 
-## Animation
+## Demo
 
 ![Spotlight View](screenshots/view.gif)
 ![Spotlight Inspect](screenshots/inspect.gif)
